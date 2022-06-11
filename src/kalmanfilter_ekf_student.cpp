@@ -45,8 +45,29 @@ void KalmanFilter::handleLidarMeasurement(LidarMeasurement meas, const BeaconMap
 
         BeaconData map_beacon = map.getBeaconWithId(meas.id); // Match Beacon with built in Data Association Id
         if (meas.id != -1 && map_beacon.id != -1)
-        {           
+        {
             // The map matched beacon positions can be accessed using: map_beacon.x AND map_beacon.y
+            float diff_x = map_beacon.x - state(0);
+            float diff_y = map_beacon.y - state(1);
+            float r = sqrt(diff_x*diff_x + diff_y*diff_y);
+            float theta = wrapAngle(atan2(diff_y, diff_x) - state(2));
+
+            Vector2d mu{meas.range - r, meas.theta - theta};
+            mu(1) = wrapAngle(mu(1));
+
+            MatrixXd H{
+                {(state(0) - map_beacon.x) / r, (state(1) - map_beacon.y) / r, 0, 0},
+                {-(state(1) - map_beacon.y) / (r*r), (state(0) - map_beacon.x) / (r*r), -1, 0}
+            };
+            Matrix2d R{
+                {LIDAR_RANGE_STD*LIDAR_RANGE_STD, 0},
+                {0, LIDAR_THETA_STD*LIDAR_THETA_STD}
+            };
+            MatrixXd S = H * cov * H.transpose() + R;
+            MatrixXd K = cov * H.transpose() * S.inverse();
+
+            state = state + K * mu;
+            cov = (Matrix4d::Identity() - K * H) * cov;
         }
 
         // ----------------------------------------------------------------------- //
@@ -72,6 +93,23 @@ void KalmanFilter::predictionStep(GyroMeasurement gyro, double dt)
         // values within correct range, otherwise strange angle effects might be seen.
         // ----------------------------------------------------------------------- //
         // ENTER YOUR CODE HERE
+
+        double v = state(3);
+        double psi = state(2);
+        Vector4d m{v * cos(psi), v * sin(psi), gyro.psi_dot, 0};
+        state = state + dt * m;
+        state(2) = wrapAngle(state(2));
+
+        MatrixXd F = Matrix4d::Identity();
+        F(0, 2) = -dt * v * sin(psi);
+        F(0, 3) = dt * cos(psi);
+        F(1, 2) = dt * v * cos(psi);
+        F(1, 3) = dt * sin(psi);
+
+        MatrixXd Q = Matrix4d::Zero();
+        Q(2, 2) = dt*dt * GYRO_STD*GYRO_STD;
+        Q(3, 3) = dt*dt * ACCEL_STD*ACCEL_STD;
+        cov = F * cov * F.transpose() + Q;
 
         // ----------------------------------------------------------------------- //
 

@@ -4,17 +4,17 @@
 // ####### STUDENT FILE #######
 //
 // Usage:
-// -Rename this file to "kalmanfilter.cpp" if you want to use this code.
+// -Rename this file to "kalmanfilter.cpp" if you want to use this code.    
 
 #include "kalmanfilter.h"
 #include "utils.h"
 
 // -------------------------------------------------- //
 // YOU CAN USE AND MODIFY THESE CONSTANTS HERE
-constexpr double ACCEL_STD = 0.05;
+constexpr double ACCEL_STD = 1.0;
 constexpr double GYRO_STD = 0.01/180.0 * M_PI;
-constexpr double INIT_VEL_STD = 2;
-constexpr double INIT_PSI_STD = 5.0/180.0 * M_PI;
+constexpr double INIT_VEL_STD = 10.0;
+constexpr double INIT_PSI_STD = 45.0/180.0 * M_PI;
 constexpr double GPS_POS_STD = 3.0;
 constexpr double LIDAR_RANGE_STD = 3.0;
 constexpr double LIDAR_THETA_STD = 0.02;
@@ -38,6 +38,15 @@ std::vector<VectorXd> generateSigmaPoints(VectorXd state, MatrixXd cov)
 
     // ----------------------------------------------------------------------- //
     // ENTER YOUR CODE HERE
+    int n = state.size();
+    int k = 3 - n;
+    MatrixXd L = cov.llt().matrixL();
+
+    sigmaPoints.emplace_back(state);
+    for (int i = 0; i < n; i++) {
+        sigmaPoints.emplace_back(state + sqrt(n + k) * L.col(i));
+        sigmaPoints.emplace_back(state - sqrt(n + k) * L.col(i));
+    }
 
     // ----------------------------------------------------------------------- //
 
@@ -51,6 +60,13 @@ std::vector<double> generateSigmaWeights(unsigned int numStates)
     // ----------------------------------------------------------------------- //
     // ENTER YOUR CODE HERE
 
+    double k = 3.0 - numStates;
+    double wi = 0.5 / (numStates + k);
+    weights.push_back(k / (numStates + k));
+    for (int i = 0; i < 2 * numStates; i++) {
+        weights.push_back(wi);
+    }
+    
     // ----------------------------------------------------------------------- //
 
     return weights;
@@ -63,6 +79,18 @@ VectorXd lidarMeasurementModel(VectorXd aug_state, double beaconX, double beacon
     // ----------------------------------------------------------------------- //
     // ENTER YOUR CODE HERE
 
+    double x = aug_state(0);
+    double y = aug_state(1);
+    double psi = aug_state(2);
+    double range_noise = aug_state(4);
+    double bearing_noise = aug_state(5);
+
+    double diff_x = beaconX - x;
+    double diff_y = beaconY - y;
+    double r = sqrt(diff_x*diff_x + diff_y*diff_y) + range_noise;
+    double theta = atan2(diff_y, diff_x) - psi + bearing_noise;
+    z_hat << r, theta;
+
     // ----------------------------------------------------------------------- //
 
     return z_hat;
@@ -74,6 +102,18 @@ VectorXd vehicleProcessModel(VectorXd aug_state, double psi_dot, double dt)
 
     // ----------------------------------------------------------------------- //
     // ENTER YOUR CODE HERE
+
+    double x = aug_state(0);
+    double y = aug_state(1);
+    double psi = aug_state(2);
+    double v = aug_state(3);
+    double heading_noise = aug_state(4);
+    double acc_noise = aug_state(5);
+
+    new_state(0) = x + dt * v * cos(psi);
+    new_state(1) = y + dt * v * sin(psi);
+    new_state(2) = psi + dt * (psi_dot + heading_noise);
+    new_state(3) = v + dt * acc_noise;
 
     // ----------------------------------------------------------------------- //
 
@@ -102,7 +142,53 @@ void KalmanFilter::handleLidarMeasurement(LidarMeasurement meas, const BeaconMap
         BeaconData map_beacon = map.getBeaconWithId(meas.id); // Match Beacon with built in Data Association Id
         if (meas.id != -1 && map_beacon.id != -1) // Check that we have a valid beacon match
         {
-           
+
+            MatrixXd R = Matrix2d::Zero();
+            R(0, 0) = LIDAR_RANGE_STD * LIDAR_RANGE_STD;
+            R(1, 1) = LIDAR_THETA_STD * LIDAR_THETA_STD;
+
+            int n_v = 2;
+            int n_z = 2;
+            int n_x = state.size();
+            int n_aug = n_x + n_v;
+            VectorXd aug_state = VectorXd::Zero(n_aug);
+            aug_state.head(n_x) = state;
+            MatrixXd aug_cov = MatrixXd::Zero(n_aug, n_aug);
+            aug_cov.topLeftCorner(n_x, n_x) = cov;
+            aug_cov.bottomRightCorner(n_v, n_v) = R;
+
+            std::vector<double> weights = generateSigmaWeights(n_aug);
+            std::vector<VectorXd> sigma_points = generateSigmaPoints(aug_state, aug_cov);
+
+            std::vector<VectorXd> z_sig;
+            for (const auto& p : sigma_points) {
+                z_sig.emplace_back(lidarMeasurementModel(p, map_beacon.x, map_beacon.y));
+            }
+
+            VectorXd z_mean = Vector2d::Zero(n_z);
+            for (int i = 0; i < z_sig.size(); i++) {
+                z_mean += weights[i] * z_sig[i];
+            }
+
+            MatrixXd S = MatrixXd::Zero(n_z, n_z);
+            for (int i = 0; i < z_sig.size(); i++) {
+                VectorXd diff = normaliseLidarMeasurement(z_sig[i] - z_mean);
+                S += weights[i] * diff * diff.transpose();
+            }
+
+            Vector2d z{meas.range, meas.theta};
+            VectorXd mu = normaliseLidarMeasurement(z - z_mean);
+
+            MatrixXd cov_xz = MatrixXd::Zero(n_x, n_z);
+            for (int i = 0; i < z_sig.size(); i++) {
+                VectorXd diff_x = normaliseState(sigma_points[i].head(n_x) - state);
+                VectorXd diff_z = normaliseLidarMeasurement(z_sig[i] - z_mean);
+                cov_xz += weights[i] * diff_x * diff_z.transpose();
+            }
+
+            MatrixXd K = cov_xz * S.inverse();
+            state = state + K * mu;
+            cov = cov - K * S * K.transpose();
 
         }
         // ----------------------------------------------------------------------- //
@@ -129,7 +215,39 @@ void KalmanFilter::predictionStep(GyroMeasurement gyro, double dt)
         // ----------------------------------------------------------------------- //
         // ENTER YOUR CODE HERE
 
+        MatrixXd Q = Matrix2d::Zero();
+        Q(0, 0) = GYRO_STD * GYRO_STD;
+        Q(1, 1) = ACCEL_STD * ACCEL_STD;
 
+        int n_w = 2;
+        int n_x = state.size();
+        int n_aug = n_x + n_w;
+        VectorXd aug_state = VectorXd::Zero(n_aug);
+        aug_state.head(n_x) = state;
+        MatrixXd aug_cov = MatrixXd::Zero(n_aug, n_aug);
+        aug_cov.topLeftCorner(n_x, n_x) = cov;
+        aug_cov.bottomRightCorner(n_w, n_w) = Q;
+
+        std::vector<double> weights = generateSigmaWeights(n_aug);
+        std::vector<VectorXd> sigma_points = generateSigmaPoints(aug_state, aug_cov);
+
+        std::vector<VectorXd> transformed;
+        for (const auto& p : sigma_points) {
+            transformed.emplace_back(vehicleProcessModel(p, gyro.psi_dot, dt));
+        }
+
+        state = Vector4d::Zero();
+        for (int i = 0; i < transformed.size(); i++) {
+            state += weights[i] * transformed[i];
+        }
+        state = normaliseState(state);
+
+        cov = Matrix4d::Zero();
+        for (int i = 0; i < transformed.size(); i++) {
+            VectorXd diff = normaliseState(transformed[i] - state);
+            cov += weights[i] * diff * diff.transpose();
+        }
+        
         // ----------------------------------------------------------------------- //
 
         setState(state);
